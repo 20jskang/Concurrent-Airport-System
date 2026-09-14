@@ -1,0 +1,303 @@
+// SWEN90004 2026 Assignment 1b
+//
+// Name: Junesuh Kang
+// Student Number: 1239956
+//
+const MAX_RUNWAYS    = 2
+const MAX_GATES      = 2
+const MAX_CAPACITY   = 5
+const MAX_FLIGHTS    = 3
+range FLIGHT_INDEX   = 0..MAX_FLIGHTS-1
+range QUEUE_RANGE    = 0..MAX_FLIGHTS
+range LANDING_RANGE  = 0..MAX_FLIGHTS
+
+// AIRCRAFT models the lifecycle of a single aircraft
+// Note on join_queue:
+// In the Java implementation, waiting arrivals are tracked implicitly via
+// thread blocking - aircraft threads call wait() inside requestLanding()
+// and Java's monitor automatically counts how many threads are blocked.
+// FSP has no concept of blocking threads - an action is either offered or
+// it isn't. join_queue explicitly models the waitingArrivals++ that occurs
+// before the while loop in Java's requestLanding(), giving the airport
+// controller a way to track queued (waiting arrivals) so it can enforce
+// arrivals priority via the guard: when (queued == 0 || gates == 0)
+// Without join_queue, the controller would have no queued to check and could
+// not distinguish between "no one waiting" and "someone waiting to land"
+AIRCRAFT = (join_queue       -> request_land    ->
+            complete_land    -> request_takeoff ->
+            complete_takeoff -> AIRCRAFT).
+
+// OPERATOR models the airport operator who cycles the airport
+// between open and closed states on a fixed schedule
+// Mirrors run() in Operator.java:
+//   beginClosing() -> awaitClosed() -> openAirport() -> repeat
+OPERATOR = (begin_closing -> await_closed -> open_airport -> OPERATOR).
+
+// AIRPORT models the airport controller as three separate processes
+// each representing one operational mode: OPEN, CLOSING, CLOSED
+// This is structurally different from encoding state as a numeric variable
+// inside one unified process - instead each mode is its own named process,
+// making valid actions per mode immediately visible in the FSP structure
+//
+// Parameters:
+//   rwy     = available runways         (0..MAX_RUNWAYS)
+//   gates   = available gates           (0..MAX_GATES)
+//   parked  = aircraft on ground        (0..MAX_CAPACITY)
+//   queued  = aircraft waiting to land  (0..MAX_FLIGHTS)
+//   landing = aircraft mid-landing      (0..MAX_FLIGHTS)
+//             between request_land and complete_land
+//
+// Gate accounting:
+//   request_land:    gates-- (gate allocated on landing request)
+//   request_takeoff: no gate change (aircraft still occupies gate on runway)
+//   complete_takeoff: gates++ (gate freed only when aircraft fully departed)
+//   This ensures no new landing is possible until departing aircraft fully leaves
+//
+// Arrivals priority rule mirrors Java requestTakeoff():
+//   while(runways == 0 || (OPEN && waitingArrivals > 0 && availableGates > 0))
+//   Takeoff blocked only when queued > 0 AND gates > 0
+//   If gates == 0, landing is impossible anyway so takeoff is permitted
+//   landing counter does NOT block takeoff - simultaneous landing and takeoff
+//   on separate runways is permitted, matching multi-runway real world behaviour
+//
+// Initial state: all runways and gates free, no aircraft on ground or waiting
+AIRPORT = AIRPORT_OPEN[MAX_RUNWAYS][MAX_GATES][0][0][0],
+
+// AIRPORT_OPEN: normal daytime operations
+// Both landing and takeoff are permitted
+// Arrivals priority enforced via request_takeoff guard
+// Mirrors the OPEN state logic in Java Airport class
+AIRPORT_OPEN[rwy:0..MAX_RUNWAYS][gates:0..MAX_GATES][parked:0..MAX_CAPACITY][queued:QUEUE_RANGE][landing:LANDING_RANGE] =
+    // Aircraft joins the landing queue, incrementing waiting count
+    // Mirrors waitingArrivals++ before the while loop in Java requestLanding()
+    // Blocked when queue is full (queued == MAX_FLIGHTS)
+    (when (queued < MAX_FLIGHTS)
+        join_queue       -> AIRPORT_OPEN[rwy][gates][parked][queued+1][landing]
+    |
+    // Aircraft acquires runway and gate, moves from queue to active landing
+    // Mirrors exit condition of the while loop in Java requestLanding()
+    // Requires: runway free, gate free, space on ground, someone waiting
+    // landing < MAX_FLIGHTS prevents landing counter exceeding bounds
+    // landing++ tracks aircraft between request_land and complete_land
+    when (rwy > 0 && gates > 0 && parked < MAX_CAPACITY && queued > 0 && landing < MAX_FLIGHTS)
+        request_land     -> AIRPORT_OPEN[rwy-1][gates-1][parked+1][queued-1][landing+1]
+    |
+    // Aircraft vacates runway after landing, stays at gate
+    // Mirrors availableRunways++ in Java completeLanding()
+    // landing-- : aircraft has finished using runway, landing phase complete
+    // Requires landing > 0 to ensure an aircraft is actually mid-landing
+    when (rwy < MAX_RUNWAYS && landing > 0)
+        complete_land    -> AIRPORT_OPEN[rwy+1][gates][parked][queued][landing-1]
+    |
+    // Aircraft acquires runway for takeoff - gate NOT yet released
+    // Gate is still occupied while aircraft taxis and uses runway
+    // Mirrors exit condition of while loop in Java requestTakeoff()
+    // Arrivals priority: takeoff blocked only when queued > 0 AND gates > 0
+    //   queued == 0: nobody waiting to land, free to depart
+    //   gates == 0: all gates full so landing impossible - must let departure free a gate
+    // Note: landing does NOT block takeoff - with multiple runways one runway
+    // can service a landing while another services a takeoff simultaneously
+    // This matches Java: while(... waitingArrivals > 0 && availableGates > 0)
+    when (rwy > 0 && gates < MAX_GATES && (queued == 0 || gates == 0))
+        request_takeoff  -> AIRPORT_OPEN[rwy-1][gates][parked][queued][landing]
+    |
+    // Aircraft fully departs - releases runway AND gate
+    // Gate only freed here, not at request_takeoff, ensuring no new landing
+    // is possible until the departing aircraft has fully left the runway
+    // Mirrors availableRunways++ and gate accounting in Java completeTakeoff()
+    when (rwy < MAX_RUNWAYS && parked > 0 && gates < MAX_GATES)
+        complete_takeoff -> AIRPORT_OPEN[rwy+1][gates+1][parked-1][queued][landing]
+    |
+    // Operator begins closing the airport
+    // Mirrors beginClosing() in Java - transitions to CLOSING state
+    // Always available when airport is open (rwy <= MAX_RUNWAYS is always true)
+    // All state carried into CLOSING including queued and landing so
+    // already-queued and mid-landing aircraft can still complete their journey
+    when (rwy <= MAX_RUNWAYS)
+        begin_closing    -> AIRPORT_CLOSING[rwy][gates][parked][queued][landing]),
+
+// AIRPORT_CLOSING: draining phase after operator begins closure
+// No NEW arrivals permitted - join_queue not offered
+// Aircraft already queued when closing began can still land (queued carried over)
+// Aircraft mid-landing when closing began can still complete (landing carried over)
+// Aircraft already on ground may still takeoff
+// Mirrors the CLOSING state logic in Java Airport class
+AIRPORT_CLOSING[rwy:0..MAX_RUNWAYS][gates:0..MAX_GATES][parked:0..MAX_CAPACITY][queued:QUEUE_RANGE][landing:LANDING_RANGE] =
+    // Already-queued aircraft can still land during closing
+    // No new join_queue offered - closed to new arrivals only
+    // Requires: runway free, gate free, space on ground, someone queued
+    // landing < MAX_FLIGHTS prevents landing counter exceeding bounds
+    (when (rwy > 0 && gates > 0 && parked < MAX_CAPACITY && queued > 0 && landing < MAX_FLIGHTS)
+        request_land     -> AIRPORT_CLOSING[rwy-1][gates-1][parked+1][queued-1][landing+1]
+    |
+    // Mid-landing aircraft complete their landing - runway released
+    // landing-- : aircraft has finished using runway
+    when (rwy < MAX_RUNWAYS && landing > 0)
+        complete_land    -> AIRPORT_CLOSING[rwy+1][gates][parked][queued][landing-1]
+    |
+    // Aircraft on ground can takeoff during closing
+    // Same priority logic as OPEN: permit takeoff when queued == 0 or gates == 0
+    // Gate NOT released here - only released at complete_takeoff
+    when (rwy > 0 && gates < MAX_GATES && (queued == 0 || gates == 0))
+        request_takeoff  -> AIRPORT_CLOSING[rwy-1][gates][parked][queued][landing]
+    |
+    // Aircraft completes takeoff - releases runway AND gate
+    // More aircraft remain on ground, stays in CLOSING
+    when (rwy < MAX_RUNWAYS && parked > 1 && gates < MAX_GATES)
+        complete_takeoff -> AIRPORT_CLOSING[rwy+1][gates+1][parked-1][queued][landing]
+    |
+    // Last aircraft on ground departs, no queued or mid-landing remain
+    // Safe to transition directly to CLOSED
+    // Mirrors if(state==CLOSING && aircraftOnGround==0) state=CLOSED in Java
+    when (rwy < MAX_RUNWAYS && parked == 1 && queued == 0 && landing == 0 && gates < MAX_GATES)
+        complete_takeoff -> AIRPORT_CLOSED
+    |
+    // Last aircraft on ground departs but queued or mid-landing aircraft remain
+    // Stay in CLOSING with parked=0 so remaining aircraft can still complete
+    // Gate released as this aircraft fully departs
+    when (rwy < MAX_RUNWAYS && parked == 1 && (queued > 0 || landing > 0) && gates < MAX_GATES)
+        complete_takeoff -> AIRPORT_CLOSING[rwy+1][gates+1][0][queued][landing]
+    |
+    // No aircraft on ground, queued or mid-landing - safe to fully close
+    // Operator can now complete closure via await_closed
+    // Mirrors awaitClosed() in Java - unblocks when aircraftOnGround==0
+    when (parked == 0 && queued == 0 && landing == 0)
+        await_closed     -> AIRPORT_CLOSED),
+
+// AIRPORT_CLOSED: overnight closure
+// No landings or takeoffs permitted
+// await_closed loops to allow operator to sync even if airport already closed
+// This handles the race where all aircraft depart before operator calls await_closed
+// open_airport restarts the full open/close cycle
+AIRPORT_CLOSED =
+    (await_closed  -> AIRPORT_CLOSED
+    |
+    open_airport   -> AIRPORT_OPEN[MAX_RUNWAYS][MAX_GATES][0][0][0]).
+
+// SYSTEM composes MAX_FLIGHTS aircraft, the airport controller and the operator
+// flight[FLIGHT_INDEX]:AIRCRAFT creates MAX_FLIGHTS individually indexed aircraft
+// flight[FLIGHT_INDEX]::AIRPORT shares one airport controller across all aircraft,
+//   prefixing all airport actions with flight[i]
+//   e.g. request_land becomes flight[0].request_land
+// The /{...} relabelling block maps per-aircraft prefixed operator actions
+//   back to their unprefixed forms so OPERATOR can synchronise with them
+//   e.g. flight[0].begin_closing -> begin_closing
+// Without this relabelling OPERATOR would never sync with the airport
+//   since it only knows begin_closing, not flight[0].begin_closing
+||SYSTEM = (flight[FLIGHT_INDEX]:AIRCRAFT
+            || flight[FLIGHT_INDEX]::AIRPORT
+            || OPERATOR)
+            /{begin_closing/flight[0].begin_closing,
+              begin_closing/flight[1].begin_closing,
+              begin_closing/flight[2].begin_closing,
+              await_closed/flight[0].await_closed,
+              await_closed/flight[1].await_closed,
+              await_closed/flight[2].await_closed,
+              open_airport/flight[0].open_airport,
+              open_airport/flight[1].open_airport,
+              open_airport/flight[2].open_airport}.
+
+// ============================================================
+// Task 2: Safety and Liveness Properties
+// ============================================================
+
+// --- SAFETY PROPERTIES ---
+// Safety properties use the 'property' keyword
+// They define an automaton that must never reach an ERROR state
+// LTSA checks these via Check -> Safety
+
+// RUNWAY_MUTEX: Runway mutual exclusion
+// At most one aircraft may occupy a runway at any time
+// A runway is occupied between request_land and complete_land (landing)
+// and between request_takeoff and complete_takeoff (takeoff)
+//
+// Failed attempt: we initially tried to check this by just watching
+// for runway request actions without enforcing their completion first:
+//   property RUNWAY_MUTEX = (request_land    -> RUNWAY_MUTEX
+//                           | request_takeoff -> RUNWAY_MUTEX).
+// This failed because it allowed multiple concurrent runway uses
+// without ensuring the runway was released before the next request
+//
+// Correct approach: enforce that once a runway action begins its
+// corresponding completion must occur before any other runway use
+property RUNWAY_MUTEX =
+    (request_land    -> complete_land    -> RUNWAY_MUTEX
+    |
+    request_takeoff  -> complete_takeoff -> RUNWAY_MUTEX).
+
+// NO_LAND_WHEN_CLOSING: No new landings after closure begins
+// Once begin_closing fires, request_land must never occur
+// Tracks two internal states:
+//   NO_LAND_WHEN_CLOSING: airport open, request_land permitted
+//   NO_LAND_CLOSED: airport closing/closed, request_land causes ERROR
+//
+// Failed attempt: we initially forgot to handle airport reopening
+// which meant the property stayed in NO_LAND_CLOSED permanently
+// even after open_airport fired:
+//   property NO_LAND_WHEN_CLOSING = (begin_closing -> NO_LAND_CLOSED),
+//   NO_LAND_CLOSED = (complete_takeoff -> NO_LAND_CLOSED
+//                    | await_closed    -> NO_LAND_CLOSED).
+// This failed because it did not reset back to NO_LAND_WHEN_CLOSING
+// when the airport reopened, causing false violations
+//
+// Correct approach: track all relevant actions in both states and
+// reset back to NO_LAND_WHEN_CLOSING when open_airport fires
+property NO_LAND_WHEN_CLOSING =
+    (begin_closing   -> NO_LAND_CLOSED
+    |
+    request_land     -> NO_LAND_WHEN_CLOSING
+    |
+    complete_land    -> NO_LAND_WHEN_CLOSING
+    |
+    request_takeoff  -> NO_LAND_WHEN_CLOSING
+    |
+    complete_takeoff -> NO_LAND_WHEN_CLOSING
+    |
+    await_closed     -> NO_LAND_WHEN_CLOSING
+    |
+    open_airport     -> NO_LAND_WHEN_CLOSING),
+NO_LAND_CLOSED =
+    (complete_land    -> NO_LAND_CLOSED
+    |
+    request_takeoff   -> NO_LAND_CLOSED
+    |
+    complete_takeoff  -> NO_LAND_CLOSED
+    |
+    await_closed      -> NO_LAND_CLOSED
+    |
+    open_airport      -> NO_LAND_WHEN_CLOSING).
+
+// --- LIVENESS PROPERTIES ---
+// Liveness properties use the 'progress' keyword
+// They assert that a set of actions must eventually occur
+// in every infinite execution - no action is permanently blocked
+// LTSA checks these via Check -> Progress
+//
+// Note on progress violations:
+// LTSA's progress checker explores all possible schedulings including
+// pathologically unfair ones. It may report violations for FLIGHTS_LAND
+// and FLIGHTS_DEPART because it can find a theoretical execution where
+// flight[0] monopolises the runway forever while others wait indefinitely.
+// This is a scheduling fairness issue not a logic error - the assignment
+// specification explicitly states fairness is not required, so these
+// violations are expected and acceptable as a known limitation
+
+// FLIGHTS_LAND: an aircraft that joins the queue eventually lands
+// Verifies request_land is never permanently blocked
+// i.e. no aircraft waits forever in the landing queue
+progress FLIGHTS_LAND    = {request_land}
+
+// FLIGHTS_DEPART: an aircraft that lands eventually takes off
+// Verifies complete_takeoff is never permanently blocked
+// i.e. no aircraft is stuck at the gate forever
+progress FLIGHTS_DEPART  = {complete_takeoff}
+
+// AIRPORT_CLOSES: the airport eventually completes closure
+// Verifies await_closed is never permanently blocked
+// i.e. when operator begins closing, closure always completes
+progress AIRPORT_CLOSES  = {await_closed}
+
+// AIRPORT_REOPENS: the airport eventually reopens after closing
+// Verifies open_airport is never permanently blocked
+// i.e. the airport never stays closed forever
+progress AIRPORT_REOPENS = {open_airport}

@@ -1,0 +1,19 @@
+Name: Junesuh Kang
+Student Number: 1239956
+
+1. Correctness
+
+I believe my implementation followed the correct approach based on extensive testing. Rather than listing the trace steps, I think the more interesting correctness bases off the design. All synchronization and logging lives exclusively in Airport.java, while Aircraft and Operator are kept intentionally thin, they only call Airport methods and sleep. This makes it much easier to audit the concurrent logic without jumping between classes. I tested across different runway and gate counts, and the output was consistent with expected behaviour throughout. However, because thread scheduling is non-deterministic, certain interleavings may never appear during testing. FSP modelling would be needed to establish correctness with full confidence.
+
+2. Safety Property
+
+A critical safety property is that freeRunways never drops below zero, ensuring runway capacity is never exceeded. Mutual exclusion is achieved through the synchronized keyword on requestLanding() and requestTakeoff(), guaranteeing only one thread can execute these methods at a time. Without this, a race condition could occur where two threads simultaneously read freeRunways > 0 and both decrement, corrupting the counter. This is prevented by the guarded while loop inside each method, which atomically checks and decrements freeRunways only when resources are available. The corresponding release methods releaseRunwayAfterLanding() and releaseAfterTakeoff() increment freeRunways and call notifyAll() to wake any blocked threads.
+
+3. Liveness & Justification
+
+One weakness of my implementation is that starvation is not strictly prevented. The core issue is that requestTakeoff() continuously yields the runway as long as (waitingToLand > 0 && state == OPEN && freeGates > 0), so under relentless arrival pressure, a departing aircraft could be starved indefinitely. However, this never escalates into a deadlock. Once the Operator calls close() and state flips to CLOSING, the priority condition breaks since state != OPEN, freeing all blocked departures. Additionally, notifyAll() is called after every state change across all synchronized methods, ensuring no thread is ever permanently suspended waiting for a signal that never comes.
+
+4. Concurrency issue and solution
+
+During development, I encountered a deadlock caused by the arrivals priority condition in requestTakeoff(). My initial condition only checked waitingToLand > 0 && state == OPEN, meaning departing aircraft would always yield to any waiting arrival. Under heavy load this created a circular wait — departures were blocked waiting for waitingToLand to hit zero, but arrivals were themselves blocked inside requestLanding() waiting for a free gate, and gates only free up when departures happen. Neither side could make progress. I detected this by stress testing with fast arrival rates and few gates, which caused the simulation to freeze entirely with no further output. My first instinct to fix this was removing freeGates > 0 from the condition entirely, but this introduced starvation in the opposite direction — departures could never proceed under continuous arrival pressure. The actual fix was keeping freeGates > 0 in the condition, so departures only yield when an arrival can genuinely proceed. If no gates are free, the departure goes ahead, releases its gate via releaseAfterTakeoff(), and calls notifyAll() — breaking the circular dependency. This is a deliberate tradeoff: priority isn't perfectly strict, but deadlock and starvation are both avoided.
+

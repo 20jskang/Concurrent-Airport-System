@@ -1,0 +1,137 @@
+// SWEN90004 2026 Assignment 1b
+//
+// Name: Junesuh Kang
+// Student Number: 1239956
+//
+// ============================================================
+// Task 3: Modified model - violates AIRPORT_CLOSES liveness property
+//
+// Modification: join_queue is now offered in AIRPORT_CLOSING_MOD
+// allowing new aircraft to continuously join the queue and land
+// after closure has begun
+//
+// Original AIRPORT_CLOSING did not offer join_queue meaning no new
+// aircraft could enter the queue during closing. This guaranteed
+// the queue would eventually drain and await_closed could fire.
+//
+// Modified AIRPORT_CLOSING_MOD adds:
+//   when (queued < MAX_FLIGHTS_MOD)
+//       join_queue -> AIRPORT_CLOSING_MOD[rwy][gates][parked][queued+1][landing]
+//
+// Why this is a plausible error:
+// A developer might think "if there is a free runway and gate,
+// why not let aircraft land?" without realising that continuously
+// allowing new arrivals during closing means the queue never drains,
+// await_closed never fires, and the airport never fully closes
+//
+// Property violated: AIRPORT_CLOSES (liveness)
+// Running Check -> Progress in LTSA will show await_closed is in
+// a terminal set that is never reached - the airport can loop
+// forever in CLOSING with new aircraft continuously joining
+//
+// Note: NO_LAND_WHEN_CLOSING safety property is also violated as
+// a direct consequence - begin_closing followed by request_land
+// is now possible. Both violations stem from the same modification.
+// ============================================================
+
+const MAX_RUNWAYS_MOD    = 2
+const MAX_GATES_MOD      = 2
+const MAX_CAPACITY_MOD   = 5
+const MAX_FLIGHTS_MOD    = 3
+range FLIGHT_INDEX_MOD   = 0..MAX_FLIGHTS_MOD-1
+range QUEUE_RANGE_MOD    = 0..MAX_FLIGHTS_MOD
+range LANDING_RANGE_MOD  = 0..MAX_FLIGHTS_MOD
+
+// AIRCRAFT_MOD: unchanged from Task 1
+AIRCRAFT_MOD = (join_queue       -> request_land    ->
+                complete_land    -> request_takeoff ->
+                complete_takeoff -> AIRCRAFT_MOD).
+
+// OPERATOR_MOD: unchanged from Task 1
+OPERATOR_MOD = (begin_closing -> await_closed -> open_airport -> OPERATOR_MOD).
+
+AIRPORT_MOD = AIRPORT_OPEN_MOD[MAX_RUNWAYS_MOD][MAX_GATES_MOD][0][0][0],
+
+// AIRPORT_OPEN_MOD: unchanged from Task 1
+AIRPORT_OPEN_MOD[rwy:0..MAX_RUNWAYS_MOD][gates:0..MAX_GATES_MOD][parked:0..MAX_CAPACITY_MOD][queued:QUEUE_RANGE_MOD][landing:LANDING_RANGE_MOD] =
+    (when (queued < MAX_FLIGHTS_MOD)
+        join_queue       -> AIRPORT_OPEN_MOD[rwy][gates][parked][queued+1][landing]
+    |
+    when (rwy > 0 && gates > 0 && parked < MAX_CAPACITY_MOD && queued > 0 && landing < MAX_FLIGHTS_MOD)
+        request_land     -> AIRPORT_OPEN_MOD[rwy-1][gates-1][parked+1][queued-1][landing+1]
+    |
+    when (rwy < MAX_RUNWAYS_MOD && landing > 0)
+        complete_land    -> AIRPORT_OPEN_MOD[rwy+1][gates][parked][queued][landing-1]
+    |
+    when (rwy > 0 && gates < MAX_GATES_MOD && (queued == 0 || gates == 0))
+        request_takeoff  -> AIRPORT_OPEN_MOD[rwy-1][gates][parked][queued][landing]
+    |
+    when (rwy < MAX_RUNWAYS_MOD && parked > 0 && gates < MAX_GATES_MOD)
+        complete_takeoff -> AIRPORT_OPEN_MOD[rwy+1][gates+1][parked-1][queued][landing]
+    |
+    when (rwy <= MAX_RUNWAYS_MOD)
+        begin_closing    -> AIRPORT_CLOSING_MOD[rwy][gates][parked][queued][landing]),
+
+// AIRPORT_CLOSING_MOD: MODIFIED - join_queue now offered during closing
+// New aircraft can continuously join the queue keeping queued > 0
+// This means the drain condition (parked==0 && queued==0 && landing==0)
+// can never be reached so await_closed never fires
+// MODIFICATION: the following is now offered during closing:
+//   when (queued < MAX_FLIGHTS_MOD)
+//       join_queue -> AIRPORT_CLOSING_MOD[rwy][gates][parked][queued+1][landing]
+AIRPORT_CLOSING_MOD[rwy:0..MAX_RUNWAYS_MOD][gates:0..MAX_GATES_MOD][parked:0..MAX_CAPACITY_MOD][queued:QUEUE_RANGE_MOD][landing:LANDING_RANGE_MOD] =
+    // MODIFICATION: join_queue now offered during closing
+    // New arrivals continuously join keeping queued > 0 indefinitely
+    // This prevents await_closed from ever firing
+    (when (queued < MAX_FLIGHTS_MOD)
+        join_queue       -> AIRPORT_CLOSING_MOD[rwy][gates][parked][queued+1][landing]
+    |
+    when (rwy > 0 && gates > 0 && parked < MAX_CAPACITY_MOD && queued > 0 && landing < MAX_FLIGHTS_MOD)
+        request_land     -> AIRPORT_CLOSING_MOD[rwy-1][gates-1][parked+1][queued-1][landing+1]
+    |
+    when (rwy < MAX_RUNWAYS_MOD && landing > 0)
+        complete_land    -> AIRPORT_CLOSING_MOD[rwy+1][gates][parked][queued][landing-1]
+    |
+    when (rwy > 0 && gates < MAX_GATES_MOD && (queued == 0 || gates == 0))
+        request_takeoff  -> AIRPORT_CLOSING_MOD[rwy-1][gates][parked][queued][landing]
+    |
+    when (rwy < MAX_RUNWAYS_MOD && parked > 1 && gates < MAX_GATES_MOD)
+        complete_takeoff -> AIRPORT_CLOSING_MOD[rwy+1][gates+1][parked-1][queued][landing]
+    |
+    when (rwy < MAX_RUNWAYS_MOD && parked == 1 && queued == 0 && landing == 0 && gates < MAX_GATES_MOD)
+        complete_takeoff -> AIRPORT_CLOSED_MOD
+    |
+    when (rwy < MAX_RUNWAYS_MOD && parked == 1 && (queued > 0 || landing > 0) && gates < MAX_GATES_MOD)
+        complete_takeoff -> AIRPORT_CLOSING_MOD[rwy+1][gates+1][0][queued][landing]
+    |
+    when (parked == 0 && queued == 0 && landing == 0)
+        await_closed     -> AIRPORT_CLOSED_MOD),
+
+// AIRPORT_CLOSED_MOD: unchanged from Task 1
+AIRPORT_CLOSED_MOD =
+    (await_closed  -> AIRPORT_CLOSED_MOD
+    |
+    open_airport   -> AIRPORT_OPEN_MOD[MAX_RUNWAYS_MOD][MAX_GATES_MOD][0][0][0]).
+
+||SYSTEM_MOD = (flight[FLIGHT_INDEX_MOD]:AIRCRAFT_MOD
+                || flight[FLIGHT_INDEX_MOD]::AIRPORT_MOD
+                || OPERATOR_MOD)
+                /{begin_closing/flight[0].begin_closing,
+                  begin_closing/flight[1].begin_closing,
+                  begin_closing/flight[2].begin_closing,
+                  await_closed/flight[0].await_closed,
+                  await_closed/flight[1].await_closed,
+                  await_closed/flight[2].await_closed,
+                  open_airport/flight[0].open_airport,
+                  open_airport/flight[1].open_airport,
+                  open_airport/flight[2].open_airport}.
+
+// AIRPORT_CLOSES_MOD will be violated - the system can loop forever
+// in CLOSING with new aircraft joining, await_closed never reached
+progress FLIGHTS_LAND_MOD    = {request_land}
+progress FLIGHTS_DEPART_MOD  = {complete_takeoff}
+progress AIRPORT_CLOSES_MOD  = {await_closed}
+progress AIRPORT_REOPENS_MOD = {open_airport}
+
+// Compose to verify liveness violation via Check -> Progress
+||CHECK_MOD = (SYSTEM_MOD).

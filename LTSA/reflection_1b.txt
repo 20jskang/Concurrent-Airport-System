@@ -1,0 +1,19 @@
+Junesuh Kang
+1239956
+
+Key Model Design Decision
+The most significant design decision in my FSP model was representing the airport controller as three distinct processes (AIRPORT_OPEN, AIRPORT_CLOSING, and AIRPORT_CLOSED) rather than encoding the operational state as a numeric variable within a single unified process. This structural choice mirrors the conceptual separation of airport modes directly in the process names, making the model easier to reason about. Each process only offers actions that are valid in that mode: AIRPORT_OPEN offers both landing and takeoff actions, AIRPORT_CLOSING omits join_queue for new arrivals while still servicing already queued aircraft, and AIRPORT_CLOSED offers only await_closed and open_airport. I also introduced a landing counter to track aircraft between request_land and complete_land. With multiple runways, queuing alone was insufficient since it decrements at request_land rather than complete_land, meaning a departing aircraft could acquire a runway while another was still actively landing. The landing counter resolves this by giving the controller a complete picture of all aircraft currently committed to landing.
+
+Incorrect Behaviour Encountered
+
+A key unexpected behaviour encountered during development was the operator actions begin_closing, await_closed, and open_airport becoming prefixed per aircraft when using the {flight[INDEX]}::AIRPORT composition syntax. LTSA's :: operator prefixes all shared actions with the aircraft index, producing actions like flight[0].begin_closing rather than the unprefixed begin_closing that OPERATOR synchronises on. This meant the operator and airport controller could never synchronise, causing the system to deadlock immediately. The resolution was adding a relabelling block /{begin_closing/flight[0].begin_closing, ...} to ||SYSTEM, explicitly mapping each prefixed operator action back to its unprefixed form so OPERATOR could synchronise correctly.
+
+Comparison with Java Implementation
+
+The most striking difference between my FSP model and the Java implementation is how waiting arrivals are tracked. In Java, requestLanding() uses waitingArrivals++ before a while loop where threads block on wait() , the Java monitor implicitly tracks how many threads are waiting. FSP has no concept of blocking threads; an action is either offered or it is not. This required introducing an explicit join_queue action in AIRCRAFT to increment queues before request_land is granted, directly modelling the waitingArrivals++ increment. Without join_queue, the airport controller would have no queued variable to check, making the arrivals priority guard when (queued == 0 || gates == 0) impossible to express. Java's implicit thread management is significantly easier for expressing dynamic waiting conditions, whereas FSP requires making all state changes explicit through additional actions and counters.
+
+Task 3 Modification and Property Violation
+
+The Task 3 modification introduced join_queue into AIRPORT_CLOSING_MOD, allowing new aircraft to continuously join the landing queue after the operator has announced closure. This reflects a plausible developer mistake reasoning that if runways and gates are free, why not let aircraft land. The change directly violates the liveness property AIRPORT_CLOSES, which asserts that await_closed must eventually occur in every infinite execution. The violation arises because AIRPORT_CLOSING_MOD continuously offers join_queue, keeping queued above zero indefinitely and preventing the drain condition parked == 0 && queued == 0 && landing == 0 from ever being satisfied. As a knock on effect AIRPORT_REOPENS is also violated since the airport never closes and therefore can never reopen. Running Check -> Progress in LTSA confirms both violations, showing a terminal cycle where join_queue fires repeatedly while await_closed and open_airport are never reached.
+
+
